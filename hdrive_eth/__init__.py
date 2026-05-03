@@ -15,8 +15,16 @@ Full documentation: https://henschel-robotics.ch
 """
 
 from .motor import HDriveETH
-from .telemetry import TelemetryFrame, TelemetryReceiver
-from .protocol import Mode
+from .telemetry import (
+    BinaryCanFullTelemetryFrame,
+    BinaryCanTelemetryFrame,
+    BinaryDebugTelemetryFrame,
+    TelemetryFrame,
+    TelemetryPayload,
+    TelemetryReceiver,
+    parse_telemetry_udp_payload,
+)
+from .protocol import Mode, TXTicket, position_degrees_to_od_tenths
 from .exceptions import (
     HDriveError,
     ConnectionError,
@@ -26,14 +34,21 @@ from .exceptions import (
     FirmwareVersionError,
 )
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 __author__ = "Henschel Robotics GmbH"
 
 __all__ = [
     "HDriveETH",
     "TelemetryFrame",
+    "BinaryCanTelemetryFrame",
+    "BinaryCanFullTelemetryFrame",
+    "BinaryDebugTelemetryFrame",
+    "TelemetryPayload",
     "TelemetryReceiver",
+    "parse_telemetry_udp_payload",
     "Mode",
+    "TXTicket",
+    "position_degrees_to_od_tenths",
     "HDriveError",
     "ConnectionError",
     "CommandError",

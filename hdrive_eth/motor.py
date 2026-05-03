@@ -8,7 +8,7 @@ Example::
 
     from hdrive_eth import HDriveETH
 
-    with HDriveETH("192.168.122.102") as motor:
+    with HDriveETH("192.168.1.102") as motor:
         motor.move_to(90)
         print(motor.telemetry)
 """
@@ -19,14 +19,29 @@ import logging
 import socket
 import threading
 import time
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
 
-from typing import Callable, Optional
+from typing import Callable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
-from .exceptions import CommandError, FirmwareVersionError, NotConnectedError
-from .protocol import Mode, build_control_command, build_disable_command
-from .telemetry import TelemetryFrame, TelemetryReceiver
+from .exceptions import (
+    CommandError,
+    ConnectionError,
+    FirmwareVersionError,
+    NotConnectedError
+)
+from .protocol import (
+    Mode,
+    TXTicket,
+    build_can_c2_command,
+    build_can_conf_command,
+    build_can_conf_reset_command,
+    build_can_pos_command,
+    build_control_command,
+)
+from .telemetry import TelemetryPayload, TelemetryReceiver
 
 
 # Default network ports
@@ -38,20 +53,20 @@ class HDriveETH:
     """Interface to an HDrive17-ETH servo drive.
 
     Args:
-        ip: IP address of the HDrive (e.g. ``"192.168.122.102"``).
+        ip: IP address of the HDrive (e.g. ``"192.168.1.102"``).
         tcp_port: TCP port for commands (default 1000).
         udp_port: UDP port for telemetry (default 1001).
         connect: If ``True`` (default), connect immediately on creation.
+        telemetry_ticket: ``m4s22`` / ``TicketManager::TX_Ticket`` value for streamed telemetry.
+            Default ``None`` selects ``TXTicket.BINARY`` (33×int32).
+            Use ``TXTicket.BINARY_CAN_FULL`` for the 49×int32 CAN-full layout.
+        telemetry_format: Passed to ``TelemetryReceiver`` — ``\"auto\"`` parses by UDP length,
+            or ``\"binary_can_full\"`` / ``\"binary_can\"`` / ``\"debug\"`` / ``\"binary\"`` to enforce size.
 
-    Example::
-
-        # Simple usage
-        motor = HDriveETH("192.168.122.102")
-        motor.move_to(90)
-        motor.close()
+    Example:
 
         # Context manager (recommended)
-        with HDriveETH("192.168.122.102") as motor:
+        with HDriveETH("192.168.1.102") as motor:
             motor.move_to(90)
             time.sleep(2)
             print(motor.telemetry)
@@ -63,17 +78,27 @@ class HDriveETH:
         tcp_port: Optional[int] = None,
         udp_port: Optional[int] = None,
         connect: bool = True,
+        telemetry_ticket: Optional[int] = None,
+        telemetry_format: str = "auto",
     ):
         self.ip = ip
         self.tcp_port = tcp_port or _TCP_COMMAND_PORT
         self.udp_port = udp_port or _UDP_TELEMETRY_PORT
         self._ports_from_user = (tcp_port is not None, udp_port is not None)
+        self.telemetry_ticket = (
+            TXTicket.BINARY if telemetry_ticket is None else telemetry_ticket
+        )
+        self.telemetry_format = telemetry_format
 
         self._socket: Optional[socket.socket] = None
         self._lock = threading.Lock()
         self._telemetry: Optional[TelemetryReceiver] = None
         self._user_telemetry_callback: Optional[Callable] = None
         self._connected = False
+
+        # Cached ``<canC2/>`` profile (RXConfigTicketCANAdvanced). 
+        self._can_c2_master: Tuple[int, int, int] = (0, 0, 0)
+        self._can_c2_slaves: List[Tuple[int, int, int]] = [(0, 0, 0) for _ in range(8)]
 
         if connect:
             self.connect()
@@ -86,11 +111,11 @@ class HDriveETH:
         """Connect to the HDrive over TCP and start telemetry.
 
         During connection the driver will:
-        1. Open a TCP socket for motion commands.
-        2. Read m4s16 / m4s17 to verify TCP and UDP ports.
-        3. Check m4s19 (UDP enabled) and m4s34 (autosend enabled).
-        4. Write m4s22 = 2 to select the Binary-Ticket protocol.
-        5. Start the UDP telemetry receiver.
+        1. Open a TCP socket for motion commands (port from ``tcp_port`` or default 1000).
+        2. Read firmware version (m3s0); refuse if below the minimum supported version.
+        3. Read UDP telemetry port from m4s17 unless ``udp_port`` was set explicitly.
+        4. Enable UDP (m4s19), autosend (m4s34), and select TX telemetry ticket (``m4s22``, default ``TXTicket.BINARY``).
+        5. Start the UDP telemetry receiver on the chosen UDP port.
         """
         if self._connected:
             return
@@ -103,6 +128,9 @@ class HDriveETH:
             self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self._socket.settimeout(5.0)
             self._socket.connect((self.ip, self.tcp_port))
+            # Blocking sends: a global socket timeout also limits sendall(); fast objWrite
+            # loops can fill the TCP window and spuriously hit that limit on long runs.
+            self._socket.settimeout(None)
         except OSError as exc:
             self._socket = None
             raise ConnectionError(
@@ -122,6 +150,7 @@ class HDriveETH:
         self._telemetry = TelemetryReceiver(
             port=self.udp_port,
             callback=self._user_telemetry_callback,
+            telemetry_format=self.telemetry_format,
         )
         self._telemetry.start()
 
@@ -179,15 +208,17 @@ class HDriveETH:
 
         time.sleep(0.1)
 
-        # Write m4s22 = 2 — select Binary-Ticket protocol (132-byte packets)
-        logger.debug("Writing m4s22 = 3 (binary ticket) ...")
+        # m4s22 = TicketManager::TX_Ticket (see ``hdrive_eth.protocol.TXTicket``).
+        logger.debug("Writing m4s22 = %d ...", self.telemetry_ticket)
         try:
-            self.write_object(index=4, subindex=22, value=3)
-            logger.info("m4s22 set to 3 (binary ticket protocol)")
+            self.write_object(index=4, subindex=22, value=self.telemetry_ticket)
+            logger.info("m4s22 set to %d (TX telemetry ticket)", self.telemetry_ticket)
         except CommandError as exc:
             logger.warning(
-                "Could not write m4s22 = 3 (binary ticket): %s. "
-                "Telemetry parsing may fail if the ticket format doesn't match.", exc
+                "Could not write m4s22 = %d: %s. "
+                "Telemetry parsing may fail if the ticket format doesn't match.",
+                self.telemetry_ticket,
+                exc,
             )
 
     def close(self) -> None:
@@ -198,8 +229,14 @@ class HDriveETH:
         """
         if self._connected:
             try:
-                # Send mode=0 to stop the motor
-                cmd = build_control_command(mode=0, torque=0)
+                cmd = build_control_command(
+                    position=0,
+                    speed=0,
+                    torque=0,
+                    mode=0,
+                    acc=0,
+                    decc=0,
+                )
                 self._send(cmd)
             except Exception:
                 pass
@@ -234,17 +271,17 @@ class HDriveETH:
     # ------------------------------------------------------------------
 
     @property
-    def telemetry(self) -> Optional[TelemetryFrame]:
+    def telemetry(self) -> Optional[TelemetryPayload]:
         """The latest telemetry frame, or ``None`` if no data received yet."""
         if self._telemetry is None:
             return None
         return self._telemetry.latest
 
-    def on_telemetry(self, callback: Callable[[TelemetryFrame], None]) -> None:
+    def on_telemetry(self, callback: Callable[[TelemetryPayload], None]) -> None:
         """Register a callback for every telemetry frame.
 
         Args:
-            callback: Function that receives a :class:`TelemetryFrame`.
+            callback: Function that receives each ``TelemetryPayload``.
 
         Example::
 
@@ -274,7 +311,7 @@ class HDriveETH:
         Args:
             position: Target position in degrees.
             speed: Target speed value.
-            torque: Torque limit (0–1000, where 1000 = 100%).
+            torque: Torque limit (**mNm**, same unit as object dictionary ``demandedTorque``).
             acc: Acceleration ramp value.
             decc: Deceleration ramp value.
         """
@@ -299,7 +336,7 @@ class HDriveETH:
 
         Args:
             speed: Target speed value.
-            torque: Torque limit (0–1000). Default 200 (20%).
+            torque: Torque limit (**mNm**). Default 200.
             acc: Acceleration ramp value.
             decc: Deceleration ramp value.
         """
@@ -312,30 +349,137 @@ class HDriveETH:
         )
         self._send(cmd)
 
-    def set_torque(self, torque: int, acc: int = 0, decc: int = 0) -> None:
+    def set_torque(self, torque: int) -> None:
         """Run in torque-only mode.
 
         Args:
-            torque: Torque setpoint (0–1000, where 1000 = 100%).
-            acc: Acceleration ramp value.
-            decc: Deceleration ramp value.
+            torque: Torque setpoint (**mNm**; written to ``demandedTorque``).
         """
+        # Explicit zero pos/speed: build_control_command defaults include speed=500,
+        # which would otherwise stay on the wire and can keep velocity/position loops engaged.
         cmd = build_control_command(
+            position=0,
+            speed=0,
             torque=torque,
             mode=Mode.TORQUE_CONTROL,
-            acc=acc,
-            decc=decc,
+            acc=0,
+            decc=0,
         )
         self._send(cmd)
 
     def stop(self) -> None:
         """Stop the motor by setting mode to 0."""
-        cmd = build_control_command(mode=0, torque=0)
+        cmd = build_control_command(
+            position=0,
+            speed=0,
+            torque=0,
+            mode=0,
+            acc=0,
+            decc=0,
+        )
         self._send(cmd)
 
-    def disable(self) -> None:
-        """Disable the drive (motor free-wheels)."""
-        self._send(build_disable_command())
+    # ------------------------------------------------------------------
+    # CAN TCP tickets (firmware CommRX_Tickets: canPos, canC2, canConf)
+    # ------------------------------------------------------------------
+
+    def stop_master_and_can_slaves(self, *chain_slots: int) -> None:
+        self.stop()
+        if not chain_slots:
+            return
+        try:
+            self._send(build_can_conf_reset_command())
+        except Exception:
+            logger.exception("stop_master_and_can_slaves failed")
+
+    def set_can_master_and_slave_target_profile(
+        self,
+        master_triplet: Tuple[int, int, int],
+        *slave_triplets: Tuple[int, int, int],
+    ) -> None:
+        """Send ``<canC2/>``: ``master_triplet`` is Ethernet master ``(speed, acc, dec)``.
+
+        Each ``slave_triplets`` entry is slave 1, slave 2, … in order (at most eight).
+        Omitted slaves are sent as ``(0, 0, 0)``.
+        """
+        if len(master_triplet) != 3:
+            raise ValueError(f"master_triplet must be length 3, got {master_triplet!r}")
+        if len(slave_triplets) > 8:
+            raise ValueError(f"at most 8 slave triplets, got {len(slave_triplets)}")
+        for t in slave_triplets:
+            if len(t) != 3:
+                raise ValueError(f"each slave triplet must be length 3, got {t!r}")
+
+        self._can_c2_master = (
+            int(master_triplet[0]),
+            int(master_triplet[1]),
+            int(master_triplet[2]),
+        )
+
+        new_slaves = [(0, 0, 0) for _ in range(8)]
+        for i, t in enumerate(slave_triplets):
+            if i >= 8:
+                break
+            new_slaves[i] = (int(t[0]), int(t[1]), int(t[2]))
+        self._can_c2_slaves = new_slaves
+
+        self._send(
+            build_can_c2_command(
+                self._can_c2_master[0],
+                self._can_c2_master[1],
+                self._can_c2_master[2],
+                self._can_c2_slaves,
+            )
+        )
+
+    def send_can_pos(self, master_deg: float, *slave_deg: float) -> None:
+        self._send(build_can_pos_command(master_deg, *slave_deg))
+
+    def send_can_c2(
+        self,
+        master_speed: int,
+        master_acc: int,
+        master_decc: int,
+        *slave_triplets: Tuple[int, int, int],
+    ) -> None:
+        self._send(
+            build_can_c2_command(
+                master_speed, master_acc, master_decc, list(slave_triplets)
+            )
+        )
+
+    def set_can_master_and_slave_configuration(
+        self,
+        master_mode: int,
+        master_torque: int,
+        slave_mode: Sequence[int],
+        slave_torque: Sequence[int],
+    ) -> None:
+        """Send ``<canConf/>`` (firmware ``RXConfigTicketCAN`` / ``parseTicketInt32s``).
+
+        Wire layout (26 ints, ``RXConfigTicketCAN.h``): ``demandedTorque``, ``demandedMode``,
+        then **eight** ``slaveN_targetCurrent`` (**mNm**), then **eight** ``slaveN_targetMode``,
+        then eight ``slaveN_specialCommand`` (use ``0`` / ``NoCommand``).
+
+        Pass **slave modes** then **slave torques** (same order as master mode/torque) to avoid
+        swapping the two lists at the call site. Each list pads to eight entries.
+        """
+        sm = [int(x) for x in slave_mode]
+        st = [int(x) for x in slave_torque]
+        if len(st) > 8 or len(sm) > 8:
+            raise ValueError(
+                f"slave_mode and slave_torque must have at most 8 entries, got {len(sm)} and {len(st)}"
+            )
+        while len(st) < 8:
+            st.append(0)
+        while len(sm) < 8:
+            sm.append(0)
+        special = [0] * 8
+        values = [int(master_torque), int(master_mode), *st, *sm, *special]
+        self._send(build_can_conf_command(values))
+
+    def set_can_stop(self) -> None:
+        self.set_can_master_and_slave_configuration(0, 0, [0] * 8, [0] * 8)
 
     # ------------------------------------------------------------------
     # Object read / write
@@ -393,14 +537,16 @@ class HDriveETH:
         import re
         xml = f'<objRead a="{index}" b="{subindex}" />'
         with self._lock:
+            sock = self._socket
+            prev_timeout = sock.gettimeout()
             try:
-                self._socket.settimeout(5.0)
-                self._socket.sendall(xml.encode("ascii"))
+                sock.settimeout(5.0)
+                sock.sendall(xml.encode("ascii"))
 
                 buf = ""
                 while True:
                     try:
-                        chunk = self._socket.recv(4096)
+                        chunk = sock.recv(4096)
                     except socket.timeout:
                         logger.debug("objRead m%ds%d: recv timed out", index, subindex)
                         return None
@@ -418,6 +564,8 @@ class HDriveETH:
             except OSError as exc:
                 logger.debug("objRead m%ds%d: OSError %s", index, subindex, exc)
                 return None
+            finally:
+                sock.settimeout(prev_timeout)
 
     def _reconnect_tcp(self) -> None:
         """Close and re-open the TCP socket."""
@@ -431,6 +579,7 @@ class HDriveETH:
             self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self._socket.settimeout(5.0)
             self._socket.connect((self.ip, self.tcp_port))
+            self._socket.settimeout(None)
             self._connected = True
         except OSError as exc:
             self._connected = False
@@ -463,6 +612,47 @@ class HDriveETH:
                     f"Failed to write object m{index}s{subindex}={value} — {exc}"
                 ) from exc
 
+    # ------------------------------------------------------------------
+    # CAN slave object gateway (HTTP — firmware handles transaction)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _slvobj_http_get(master_ip: str, ticket: str, timeout: float) -> str:
+        url = f"http://{master_ip}/getData.cgi?slvobj={ticket}"
+        try:
+            with urlopen(url, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise CommandError(f"slvobj HTTP {exc.code}: {body}") from exc
+        except URLError as exc:
+            raise ConnectionError(f"slvobj HTTP GET failed: {exc}") from exc
+
+    @staticmethod
+    def read_slvobj(
+        master_ip: str,
+        slot: int,
+        main_key: int,
+        sub_key: int,
+        timeout: float,
+    ) -> str:
+        """GET ``getData.cgi?slvobj=r_<slot>_<mainKey>_<subKey>`` (synchronous in firmware)."""
+        ticket = f"r_{int(slot)}_{int(main_key)}_{int(sub_key)}"
+        return HDriveETH._slvobj_http_get(master_ip, ticket, timeout)
+
+    @staticmethod
+    def write_slvobj(
+        master_ip: str,
+        slot: int,
+        main_key: int,
+        sub_key: int,
+        value: int,
+        timeout: float,
+    ) -> str:
+        """GET ``getData.cgi?slvobj=w_<slot>_<mainKey>_<subKey>_<value>`` (synchronous in firmware)."""
+        ticket = f"w_{int(slot)}_{int(main_key)}_{int(sub_key)}_{int(value)}"
+        return HDriveETH._slvobj_http_get(master_ip, ticket, timeout)
+
     def send_raw(
         self,
         position: int = 0,
@@ -477,10 +667,10 @@ class HDriveETH:
         Use this if the high-level methods don't cover your use case.
 
         Args:
-            position: Position setpoint in encoder counts.
+            position: Position setpoint in degrees (encoded as ``degrees × 10`` on the wire).
             speed: Speed setpoint.
-            torque: Torque limit (0–1000).
-            mode: Control mode byte (see :class:`hdrive.protocol.Mode`).
+            torque: Torque limit (**mNm**).
+            mode: Control mode byte (``Mode`` constants in ``hdrive_eth.protocol``).
             acc: Acceleration ramp value.
             decc: Deceleration ramp value.
         """

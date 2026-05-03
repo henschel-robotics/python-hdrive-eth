@@ -1,5 +1,5 @@
 """
-Stress test for HDrive17-ETH HTTP object read/write.
+Stress test for HDrive17-ETH TCP object read/write.
 
 Hammers the embedded webserver with rapid read and write requests
 to test stability. Reports throughput, latency, and errors.
@@ -157,7 +157,7 @@ def _print_stats(label: str, ok: int, errors: int, times: list):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="HDrive HTTP stress test")
+    parser = argparse.ArgumentParser(description="HDrive TCP object stress test")
     parser.add_argument("--ip", default="192.168.122.102", help="HDrive IP address")
     parser.add_argument("--reads", type=int, default=100, help="Number of read requests")
     parser.add_argument("--writes", type=int, default=100, help="Number of write requests")

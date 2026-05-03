@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hdrive-eth"
-version = "0.1.2"
+version = "0.1.3"
 description = "Python SDK for Henschel Robotics HDrive17-ETH servo drives"
 readme = "README.md"
 license = {text = "MIT"}
@@ -40,6 +40,7 @@ dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "ruff>=0.1.0",
+    "matplotlib>=3.5",
 ]
 
 [tool.setuptools.packages.find]
@@ -51,3 +52,6 @@ line-length = 100
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "integration: requires hardware (e.g. HDRIVE_IP)",
+]

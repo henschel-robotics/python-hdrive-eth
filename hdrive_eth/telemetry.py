@@ -1,9 +1,12 @@
 """
 HDrive UDP telemetry receiver.
 
-The HDrive17-ETH streams real-time telemetry data over UDP.
-Each packet is 132 bytes containing 33 little-endian int32 values
-(Binary-Ticket format, protocol object m4s22 = 2).
+The HDrive17-ETH streams real-time telemetry data over UDP as binary ``int32``
+little-endian rows. Layout depends on ``communicationValues.TXTicket`` / ``m4s22``
+(``TicketManager::TX_Ticket``): default **BinaryTicket** is 33 words (132 B); **BinaryCanTicket**
+is 29 words (116 B); **BinaryCanTicketFull** is 49 words (196 B); **BinaryDebugTicket** is
+15 words (60 B). Use ``parse_telemetry_udp_payload`` or ``telemetry_format=\"auto\"``
+to select the parser by payload length.
 
 Word   Field
 ----   ----------------------------------
@@ -49,14 +52,21 @@ import socket
 import struct
 import threading
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
 
-# Packet format: 33 × int32, little-endian  (132 bytes)
-_PACKET_FORMAT = "<33i"
-_PACKET_SIZE = struct.calcsize(_PACKET_FORMAT)  # 132 bytes
+# Binary UDP payloads — little-endian int32 (see firmware ``BinaryTicket.h``, ``BinaryCanTicket*.h``).
+_FMT_BINARY = "<33i"
+_FMT_BINARY_CAN = "<29i"
+_FMT_BINARY_CAN_FULL = "<49i"
+_FMT_DEBUG = "<15i"
+
+SIZE_BINARY = struct.calcsize(_FMT_BINARY)  # 132
+SIZE_BINARY_CAN = struct.calcsize(_FMT_BINARY_CAN)  # 116
+SIZE_BINARY_CAN_FULL = struct.calcsize(_FMT_BINARY_CAN_FULL)  # 196
+SIZE_DEBUG = struct.calcsize(_FMT_DEBUG)  # 60
 
 
 @dataclass
@@ -97,7 +107,9 @@ class TelemetryFrame:
     @classmethod
     def from_bytes(cls, data: bytes) -> "TelemetryFrame":
         """Parse a 132-byte UDP packet into a TelemetryFrame."""
-        values = list(struct.unpack(_PACKET_FORMAT, data))
+        if len(data) != SIZE_BINARY:
+            raise ValueError(f"BinaryTicket expects {SIZE_BINARY} bytes, got {len(data)}")
+        values = list(struct.unpack(_FMT_BINARY, data))
         return cls(
             time_us=values[0],
             position=values[1],
@@ -137,6 +149,156 @@ class TelemetryFrame:
         )
 
 
+@dataclass
+class BinaryCanTelemetryFrame:
+    """``BinaryCanTicket`` binary branch — 29 × int32 (`Communication/CommTX_Tickets/BinaryCanTicket.h`)."""
+
+    time_us: int
+    master_position: int
+    slave_positions: List[int]
+    motor_mode: int
+    slave_modes: List[int]
+    master_state: int
+    slave_states: List[int]
+    path_planner_prg_index: int
+    raw: List[int] = field(default_factory=list)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "BinaryCanTelemetryFrame":
+        if len(data) != SIZE_BINARY_CAN:
+            raise ValueError(f"BinaryCanTicket expects {SIZE_BINARY_CAN} bytes, got {len(data)}")
+        v = list(struct.unpack(_FMT_BINARY_CAN, data))
+        return cls(
+            time_us=v[0],
+            master_position=v[1],
+            slave_positions=v[2:10],
+            motor_mode=v[10],
+            slave_modes=v[11:19],
+            master_state=v[19],
+            slave_states=v[20:28],
+            path_planner_prg_index=v[28],
+            raw=v,
+        )
+
+
+@dataclass
+class BinaryCanFullTelemetryFrame:
+    """``BinaryCanTicketFull`` binary branch — 49 × int32 (`BinaryCanTicketFull.h`)."""
+
+    time_us: int
+    master_position: int
+    slave_positions: List[int]
+    master_velocity: int
+    slave_speeds: List[int]
+    master_torque: int
+    slave_torques: List[int]
+    motor_mode: int
+    slave_modes: List[int]
+    master_state: int
+    slave_states: List[int]
+    path_planner_prg_index: int
+    reserved_tail: Tuple[int, int]
+    raw: List[int] = field(default_factory=list)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "BinaryCanFullTelemetryFrame":
+        if len(data) != SIZE_BINARY_CAN_FULL:
+            raise ValueError(f"BinaryCanTicketFull expects {SIZE_BINARY_CAN_FULL} bytes, got {len(data)}")
+        v = list(struct.unpack(_FMT_BINARY_CAN_FULL, data))
+        return cls(
+            time_us=v[0],
+            master_position=v[1],
+            slave_positions=v[2:10],
+            master_velocity=v[10],
+            slave_speeds=v[11:19],
+            master_torque=v[19],
+            slave_torques=v[20:28],
+            motor_mode=v[28],
+            slave_modes=v[29:37],
+            master_state=v[37],
+            slave_states=v[38:46],
+            path_planner_prg_index=v[46],
+            reserved_tail=(v[47], v[48]),
+            raw=v,
+        )
+
+
+@dataclass
+class BinaryDebugTelemetryFrame:
+    """``BinaryDebugTicket`` — 15 × int32 (`BinaryDebugTicket.h`)."""
+
+    time_stamp_pos_control: int
+    position_deg10: int
+    phase_a_current_ua: int
+    phase_b_current_ua: int
+    fid_ua: int
+    fiq_ua: int
+    required_current_ua: int
+    fvd_uv: int
+    fvq_uv: int
+    fva_uv: int
+    fvb_uv: int
+    demanded_speed: int
+    velocity_mrpm: int
+    demanded_pos_control_pos_mgrad: int
+    time_stamp_pos_control2: int
+    raw: List[int] = field(default_factory=list)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "BinaryDebugTelemetryFrame":
+        if len(data) != SIZE_DEBUG:
+            raise ValueError(f"BinaryDebugTicket expects {SIZE_DEBUG} bytes, got {len(data)}")
+        v = list(struct.unpack(_FMT_DEBUG, data))
+        return cls(
+            time_stamp_pos_control=v[0],
+            position_deg10=v[1],
+            phase_a_current_ua=v[2],
+            phase_b_current_ua=v[3],
+            fid_ua=v[4],
+            fiq_ua=v[5],
+            required_current_ua=v[6],
+            fvd_uv=v[7],
+            fvq_uv=v[8],
+            fva_uv=v[9],
+            fvb_uv=v[10],
+            demanded_speed=v[11],
+            velocity_mrpm=v[12],
+            demanded_pos_control_pos_mgrad=v[13],
+            time_stamp_pos_control2=v[14],
+            raw=v,
+        )
+
+
+TelemetryPayload = Union[
+    TelemetryFrame,
+    BinaryCanTelemetryFrame,
+    BinaryCanFullTelemetryFrame,
+    BinaryDebugTelemetryFrame,
+]
+
+
+def parse_telemetry_udp_payload(data: bytes) -> TelemetryPayload:
+    """Parse a UDP payload by length (matches firmware binary TX ticket sizes)."""
+    n = len(data)
+    if n == SIZE_BINARY:
+        return TelemetryFrame.from_bytes(data)
+    if n == SIZE_BINARY_CAN_FULL:
+        return BinaryCanFullTelemetryFrame.from_bytes(data)
+    if n == SIZE_BINARY_CAN:
+        return BinaryCanTelemetryFrame.from_bytes(data)
+    if n == SIZE_DEBUG:
+        return BinaryDebugTelemetryFrame.from_bytes(data)
+    raise ValueError(f"Unrecognized binary telemetry size: {n} bytes")
+
+
+_FORMAT_TO_SIZE = {
+    "binary": SIZE_BINARY,
+    "binary_can": SIZE_BINARY_CAN,
+    "binary_can_full": SIZE_BINARY_CAN_FULL,
+    "debug": SIZE_DEBUG,
+}
+
+
 class TelemetryReceiver:
     """Background UDP receiver for HDrive telemetry.
 
@@ -145,23 +307,27 @@ class TelemetryReceiver:
 
     Args:
         port: UDP port to listen on (default 1001).
-        callback: Optional function called with each :class:`TelemetryFrame`.
+        callback: Optional function called with each parsed payload (see ``parse_telemetry_udp_payload``).
+        telemetry_format: ``\"auto\"`` selects parser by UDP payload length; or force ``\"binary\"``,
+            ``\"binary_can\"``, ``\"binary_can_full\"``, ``\"debug\"`` to accept only that size.
     """
 
     def __init__(
         self,
         port: int = 1001,
-        callback: Optional[Callable[[TelemetryFrame], None]] = None,
+        callback: Optional[Callable[[TelemetryPayload], None]] = None,
+        telemetry_format: str = "auto",
     ):
         self.port = port
         self.callback = callback
-        self._latest: Optional[TelemetryFrame] = None
+        self.telemetry_format = telemetry_format
+        self._latest: Optional[TelemetryPayload] = None
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
     @property
-    def latest(self) -> Optional[TelemetryFrame]:
+    def latest(self) -> Optional[TelemetryPayload]:
         """The most recently received telemetry frame (thread-safe)."""
         with self._lock:
             return self._latest
@@ -196,7 +362,42 @@ class TelemetryReceiver:
             logger.error("Failed to bind UDP socket on port %d: %s", self.port, exc)
             return
 
-        logger.info("UDP telemetry receiver listening on port %d (expecting %d-byte packets)", self.port, _PACKET_SIZE)
+        if self.telemetry_format == "auto":
+            expected_size: Optional[int] = None
+            logger.info(
+                "UDP telemetry receiver listening on port %d "
+                "(auto format: %d / %d / %d / %d-byte binary payloads)",
+                self.port,
+                SIZE_BINARY,
+                SIZE_BINARY_CAN,
+                SIZE_BINARY_CAN_FULL,
+                SIZE_DEBUG,
+            )
+        else:
+            expected_size = _FORMAT_TO_SIZE.get(self.telemetry_format)
+            if expected_size is None:
+                logger.warning(
+                    "Unknown telemetry_format %r — using auto length detection",
+                    self.telemetry_format,
+                )
+                expected_size = None
+                logger.info(
+                    "UDP telemetry receiver listening on port %d "
+                    "(auto format: %d / %d / %d / %d-byte binary payloads)",
+                    self.port,
+                    SIZE_BINARY,
+                    SIZE_BINARY_CAN,
+                    SIZE_BINARY_CAN_FULL,
+                    SIZE_DEBUG,
+                )
+            else:
+                logger.info(
+                    "UDP telemetry receiver listening on port %d "
+                    "(expecting %d-byte packets, format=%s)",
+                    self.port,
+                    expected_size,
+                    self.telemetry_format,
+                )
 
         packet_count = 0
         drop_count = 0
@@ -218,22 +419,36 @@ class TelemetryReceiver:
 
                 timeout_count = 0  # reset on any received data
 
-                if len(data) != _PACKET_SIZE:
+                if expected_size is not None and len(data) != expected_size:
                     drop_count += 1
                     logger.warning(
                         "Dropped UDP packet from %s: got %d bytes, expected %d "
                         "(total dropped: %d)",
-                        addr, len(data), _PACKET_SIZE, drop_count,
+                        addr,
+                        len(data),
+                        expected_size,
+                        drop_count,
+                    )
+                    continue
+
+                try:
+                    frame = parse_telemetry_udp_payload(data)
+                except ValueError:
+                    drop_count += 1
+                    logger.warning(
+                        "Dropped UDP packet from %s: unsupported size %d bytes (total dropped: %d)",
+                        addr,
+                        len(data),
+                        drop_count,
                     )
                     continue
 
                 packet_count += 1
                 if packet_count == 1:
-                    logger.info("First UDP telemetry packet received from %s", addr)
+                    logger.info("First UDP telemetry packet received from %s (%s)", addr, type(frame).__name__)
                 elif packet_count % 1000 == 0:
                     logger.debug("Received %d telemetry packets so far", packet_count)
 
-                frame = TelemetryFrame.from_bytes(data)
                 with self._lock:
                     self._latest = frame
 

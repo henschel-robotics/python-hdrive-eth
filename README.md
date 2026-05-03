@@ -69,7 +69,7 @@ On connection the driver will:
 1. Open a TCP socket to the drive
 2. Read the firmware version (`m3s0`) and refuse to connect if < 266
 3. Discover the UDP telemetry port (`m4s17`)
-4. Configure telemetry: check UDP enabled (`m4s19`), autosend (`m4s34`), set binary protocol (`m4s22=2`)
+4. Configure telemetry: check UDP enabled (`m4s19`), autosend (`m4s34`), set binary TX ticket (`m4s22=3`, `TX_BinaryTicket`; value `2` is the smaller debug binary ticket, not this layout)
 5. Start the UDP telemetry receiver
 
 ### Position Control
@@ -95,7 +95,7 @@ motor.set_speed(speed=500, torque=300)
 ### Torque Control
 
 ```python
-# Direct torque setpoint (0–1000)
+# Direct torque setpoint in milli-newton-metres (mNm; firmware demandedTorque)
 motor.set_torque(torque=200)
 ```
 
@@ -113,8 +113,8 @@ motor.stop()
 version = motor.read_object(index=3, subindex=0)
 print(f"Firmware version: {version}")
 
-# Write a drive object (e.g. set ticket protocol m4s22 = 2)
-motor.write_object(index=4, subindex=22, value=2)
+# Write a drive object (e.g. select BinaryTicket telemetry — m4s22 = 3)
+motor.write_object(index=4, subindex=22, value=3)
 ```
 
 ### Telemetry
@@ -136,6 +136,23 @@ def on_frame(frame):
 motor.on_telemetry(on_frame)
 ```
 
+Alternate TX layouts match ``TicketManager::TX_Ticket`` (see ``hdrive_eth.TXTicket``): **Binary CAN** (29×int32), **Binary CAN full** (49×int32, positions/speeds/torques/modes/states per axis), **debug** (15×int32). Example:
+
+```python
+from hdrive_eth import HDriveETH, TXTicket, BinaryCanFullTelemetryFrame
+
+motor = HDriveETH(
+    "192.168.122.102",
+    telemetry_ticket=TXTicket.BINARY_CAN_FULL,
+    telemetry_format="binary_can_full",  # optional: reject other UDP sizes
+)
+t = motor.telemetry
+if isinstance(t, BinaryCanFullTelemetryFrame):
+    print(t.master_torque, t.slave_torques)
+```
+
+With ``telemetry_format="auto"`` (default), the parser selects the layout from the UDP payload length.
+
 ### Raw Command
 
 ```python
@@ -156,14 +173,14 @@ motor.send_raw(
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `Mode.POSITION_CONTROL` | 0x87 | Position + torque + velocity + enable |
-| `Mode.VELOCITY_CONTROL` | 0x85 | Velocity + torque + enable |
-| `Mode.TORQUE_CONTROL` | 0x81 | Torque + enable |
-| `Mode.DISABLE` | 0x00 | Disable the drive |
+| `Mode.TORQUE_CONTROL` | 0x80 (128) | Profile torque / current (`AXIS_STATE_MOTORMODE_CURRENT`) |
+| `Mode.POSITION_CONTROL` | 0x81 (129) | Profile position (`AXIS_STATE_MOTORMODE_POSITION`) |
+| `Mode.VELOCITY_CONTROL` | 0x82 (130) | Profile speed (`AXIS_STATE_MOTORMODE_SPEED`) |
+| `Mode.DISABLE` | 0x00 | Stop (`AXIS_STATE_MOTORMODE_STOP`) |
 
 ## Telemetry Frame Fields
 
-The binary telemetry frame contains 33 `int32` values received via UDP at ~1 kHz:
+With ``TXTicket.BINARY`` (default), each UDP packet has 33 `int32` values (~1 kHz):
 
 | Index | Field | Description |
 |-------|-------|-------------|
