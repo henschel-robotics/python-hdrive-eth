@@ -469,7 +469,7 @@ def main() -> None:
     p.add_argument(
         "--command-interval",
         type=float,
-        default=0.5,
+        default=1.5,
         help="Seconds between new random demanded positions",
     )
     p.add_argument("--plot-stride", type=int, default=100, help="UDP frames per downsampled plot point")

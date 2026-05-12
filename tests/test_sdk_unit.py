@@ -141,6 +141,58 @@ def test_read_slave_object_uses_objreadcan_and_parses_value():
     sock.sendall.assert_called_once_with(b'<objReadCAN sl="0" m="3" s="15" />')
 
 
+def test_read_object_single_ticket_response_still_works():
+    from hdrive_eth.motor import HDriveETH
+
+    motor = HDriveETH("127.0.0.1", connect=False)
+    sock = MagicMock()
+    sock.gettimeout.return_value = None
+    sock.recv.side_effect = [b'<r a="4" b="17" v="1001" />']
+    motor._socket = sock
+    motor._connected = True
+
+    out = motor.read_object(4, 17)
+
+    assert out == 1001
+    sock.sendall.assert_called_once_with(b'<objRead a="4" b="17" />')
+
+
+def test_read_object_accepts_ticket_split_across_recv_chunks():
+    from hdrive_eth.motor import HDriveETH
+
+    motor = HDriveETH("127.0.0.1", connect=False)
+    sock = MagicMock()
+    sock.gettimeout.return_value = None
+    sock.recv.side_effect = [b'<r a="4" ', b'b="22" v="3" />']
+    motor._socket = sock
+    motor._connected = True
+
+    out = motor.read_object(4, 22)
+
+    assert out == 3
+    assert sock.recv.call_count == 2
+
+
+def test_tcp_read_buffer_preserves_extra_ticket_for_next_call():
+    from hdrive_eth.motor import HDriveETH
+
+    motor = HDriveETH("127.0.0.1", connect=False)
+    sock = MagicMock()
+    sock.gettimeout.return_value = None
+    sock.recv.side_effect = [
+        b'<r a="3" b="0" v="266" /><r sl="0" a="0" b="6" v="243" />'
+    ]
+    motor._socket = sock
+    motor._connected = True
+
+    first = motor.read_object(3, 0)
+    second = motor.read_slave_object(0, 0, 6)
+
+    assert first == 266
+    assert second == 243
+    assert sock.recv.call_count == 1
+
+
 def test_read_slave_object_http_transport_uses_slvobj_gateway():
     from hdrive_eth.motor import HDriveETH
 

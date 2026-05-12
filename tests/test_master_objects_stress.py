@@ -214,7 +214,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     p.add_argument(
         "--ip",
-        default=os.environ.get("HDRIVE_IP", "192.168.1.102"),
+        default=os.environ.get("HDRIVE_IP", "192.168.2.102"),
         help="Drive IP (or set HDRIVE_IP)",
     )
     p.add_argument(

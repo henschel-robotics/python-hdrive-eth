@@ -26,6 +26,7 @@ from urllib.request import urlopen
 from typing import Callable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
+_READ_TICKET_RE = re.compile(r"<r\s[^>]*/>")
 
 from .exceptions import (
     CommandError,
@@ -93,6 +94,7 @@ class HDriveETH:
 
         self._socket: Optional[socket.socket] = None
         self._lock = threading.Lock()
+        self._tcp_rx_buf = ""
         self._telemetry: Optional[TelemetryReceiver] = None
         self._user_telemetry_callback: Optional[Callable] = None
         self._connected = False
@@ -138,6 +140,7 @@ class HDriveETH:
                 f"Could not connect to HDrive at {self.ip}:{self.tcp_port} — {exc}"
             ) from exc
 
+        self._tcp_rx_buf = ""
         self._connected = True
 
         # Check firmware version (m3s0) — must be >= 266
@@ -252,6 +255,7 @@ class HDriveETH:
                 pass
             self._socket = None
 
+        self._tcp_rx_buf = ""
         self._connected = False
 
     @property
@@ -612,36 +616,9 @@ class HDriveETH:
         """Send an objRead request and return the response, or None if the
         connection was closed."""
         xml = f'<objRead a="{index}" b="{subindex}" />'
+        label = f"objRead m{index}s{subindex}"
         with self._lock:
-            sock = self._socket
-            prev_timeout = sock.gettimeout()
-            try:
-                sock.settimeout(5.0)
-                sock.sendall(xml.encode("ascii"))
-
-                buf = ""
-                while True:
-                    try:
-                        chunk = sock.recv(4096)
-                    except socket.timeout:
-                        logger.debug("objRead m%ds%d: recv timed out", index, subindex)
-                        return None
-                    if not chunk:
-                        # Drive closed the connection
-                        logger.debug("objRead m%ds%d: connection closed by drive",
-                                     index, subindex)
-                        return None
-                    buf += chunk.decode("ascii", errors="replace")
-
-                    # Match new format: <r a="..." b="..." v="..." />
-                    match = re.search(r'<r\s[^>]*/>', buf)
-                    if match:
-                        return match.group(0)
-            except OSError as exc:
-                logger.debug("objRead m%ds%d: OSError %s", index, subindex, exc)
-                return None
-            finally:
-                sock.settimeout(prev_timeout)
+            return self._send_and_recv_read_ticket(xml, label)
 
     def _try_read_slave_object(
         self, slot: int, index: int, subindex: int
@@ -649,49 +626,47 @@ class HDriveETH:
         """Send an ``objReadCAN`` request and return the response, or ``None`` if
         the connection was closed."""
         xml = f'<objReadCAN sl="{slot}" m="{index}" s="{subindex}" />'
+        label = f"objReadCAN sl{slot}m{index}s{subindex}"
         with self._lock:
-            sock = self._socket
-            prev_timeout = sock.gettimeout()
-            try:
-                sock.settimeout(5.0)
-                sock.sendall(xml.encode("ascii"))
+            return self._send_and_recv_read_ticket(xml, label)
 
-                buf = ""
-                while True:
-                    try:
-                        chunk = sock.recv(4096)
-                    except socket.timeout:
-                        logger.debug(
-                            "objReadCAN sl%dm%ds%d: recv timed out",
-                            slot,
-                            index,
-                            subindex,
-                        )
-                        return None
-                    if not chunk:
-                        logger.debug(
-                            "objReadCAN sl%dm%ds%d: connection closed by drive",
-                            slot,
-                            index,
-                            subindex,
-                        )
-                        return None
-                    buf += chunk.decode("ascii", errors="replace")
+    def _pop_read_ticket_from_buffer(self) -> Optional[str]:
+        match = _READ_TICKET_RE.search(self._tcp_rx_buf)
+        if not match:
+            return None
+        ticket = match.group(0)
+        self._tcp_rx_buf = self._tcp_rx_buf[match.end():]
+        return ticket
 
-                    match = re.search(r'<r\s[^>]*/>', buf)
-                    if match:
-                        return match.group(0)
-            except OSError as exc:
-                logger.debug(
-                    "objReadCAN sl%dm%ds%d: OSError %s",
-                    slot,
-                    index,
-                    subindex,
-                    exc,
-                )
-                return None
-            finally:
-                sock.settimeout(prev_timeout)
+    def _send_and_recv_read_ticket(self, xml: str, label: str) -> Optional[str]:
+        sock = self._socket
+        prev_timeout = sock.gettimeout()
+        try:
+            sock.settimeout(5.0)
+            sock.sendall(xml.encode("ascii"))
+
+            ticket = self._pop_read_ticket_from_buffer()
+            if ticket is not None:
+                return ticket
+
+            while True:
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    logger.debug("%s: recv timed out", label)
+                    return None
+                if not chunk:
+                    logger.debug("%s: connection closed by drive", label)
+                    return None
+                self._tcp_rx_buf += chunk.decode("ascii", errors="replace")
+                ticket = self._pop_read_ticket_from_buffer()
+                if ticket is not None:
+                    return ticket
+        except OSError as exc:
+            logger.debug("%s: OSError %s", label, exc)
+            return None
+        finally:
+            sock.settimeout(prev_timeout)
 
     def _reconnect_tcp(self) -> None:
         """Close and re-open the TCP socket."""
@@ -706,6 +681,7 @@ class HDriveETH:
             self._socket.settimeout(5.0)
             self._socket.connect((self.ip, self.tcp_port))
             self._socket.settimeout(None)
+            self._tcp_rx_buf = ""
             self._connected = True
         except OSError as exc:
             self._connected = False
