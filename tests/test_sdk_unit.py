@@ -21,6 +21,21 @@ from hdrive_eth.telemetry import (
 )
 
 
+def test_parse_ticket_int32s_attribute_values_only():
+    """Firmware ``parseTicketInt32s``: ints from values after ``=``, not from names like ``d1``."""
+    from hdrive_eth.protocol import parse_ticket_int32s
+
+    assert parse_ticket_int32s('<system d1="2" d2="1" d3="2" d4="3" />') == [2, 1, 2, 3]
+    assert parse_ticket_int32s('<system mode="4" b="0" c="0" d="0" />') == [4, 0, 0, 0]
+    assert parse_ticket_int32s('<canC2 ms="500" ma="200" md="2000" s1s="77" s1a="1000" />') == [
+        500,
+        200,
+        2000,
+        77,
+        1000,
+    ]
+
+
 def test_mode_constants_match_firmware_op_modes():
     """Values align with IOperationMode::opModes in firmwarev1."""
     assert Mode.TORQUE_CONTROL == 0x80  # AXIS_STATE_MOTORMODE_CURRENT
@@ -30,7 +45,7 @@ def test_mode_constants_match_firmware_op_modes():
 
 
 def test_build_can_pos_command_wire_format():
-    """Quoting, °×10 encoding, and digit-free names for ``parseTicketInt32s`` (see ``protocol``)."""
+    """Quoting and °×10 encoding; wire order is ``a``…``i`` (see ``protocol.build_can_pos_command``)."""
     from hdrive_eth.protocol import build_can_pos_command
 
     cmd = build_can_pos_command(12.3, -4.5, 6.0).decode("ascii")
@@ -110,8 +125,97 @@ def test_read_slvobj_get_url_and_decode():
     assert call_url == "http://1.2.3.4/getData.cgi?slvobj=r_0_1_2"
 
 
+def test_read_slave_object_uses_objreadcan_and_parses_value():
+    from hdrive_eth.motor import HDriveETH
+
+    motor = HDriveETH("127.0.0.1", connect=False)
+    sock = MagicMock()
+    sock.gettimeout.return_value = None
+    sock.recv.side_effect = [b'<r sl="0" a="3" b="15" v="-42" />']
+    motor._socket = sock
+    motor._connected = True
+
+    out = motor.read_slave_object(0, 3, 15)
+
+    assert out == -42
+    sock.sendall.assert_called_once_with(b'<objReadCAN sl="0" m="3" s="15" />')
+
+
+def test_read_slave_object_http_transport_uses_slvobj_gateway():
+    from hdrive_eth.motor import HDriveETH
+
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = b"OK 42\n"
+    mock_cm = MagicMock()
+    mock_cm.__enter__.return_value = mock_resp
+    mock_cm.__exit__.return_value = None
+
+    motor = HDriveETH("1.2.3.4", connect=False)
+    with patch("hdrive_eth.motor.urlopen", return_value=mock_cm) as uo:
+        out = motor.read_slave_object(0, 1, 2, transport="http", timeout=3.0)
+
+    assert out == 42
+    uo.assert_called_once()
+    call_url = uo.call_args[0][0]
+    assert call_url == "http://1.2.3.4/getData.cgi?slvobj=r_0_1_2"
+
+
+def test_read_slave_object_http_transport_accepts_plain_integer_body():
+    from hdrive_eth.motor import HDriveETH
+
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = b" 42 \n"
+    mock_cm = MagicMock()
+    mock_cm.__enter__.return_value = mock_resp
+    mock_cm.__exit__.return_value = None
+
+    motor = HDriveETH("1.2.3.4", connect=False)
+    with patch("hdrive_eth.motor.urlopen", return_value=mock_cm):
+        out = motor.read_slave_object(0, 1, 2, transport="http")
+
+    assert out == 42
+
+
+def test_read_slave_object_raises_on_compact_error_response():
+    from hdrive_eth.motor import HDriveETH
+
+    motor = HDriveETH("127.0.0.1", connect=False)
+    sock = MagicMock()
+    sock.gettimeout.return_value = None
+    sock.recv.side_effect = [b'<r sl="0" a="3" b="15" error="7" />']
+    motor._socket = sock
+    motor._connected = True
+
+    with pytest.raises(hdrive_eth.CommandError, match=r"sl0m3s15"):
+        motor.read_slave_object(0, 3, 15)
+
+
+def test_read_slave_object_http_transport_raises_on_err_body():
+    from hdrive_eth.motor import HDriveETH
+
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = b"ERR 3"
+    mock_cm = MagicMock()
+    mock_cm.__enter__.return_value = mock_resp
+    mock_cm.__exit__.return_value = None
+
+    motor = HDriveETH("1.2.3.4", connect=False)
+    with patch("hdrive_eth.motor.urlopen", return_value=mock_cm):
+        with pytest.raises(hdrive_eth.CommandError, match=r"sl0m1s2"):
+            motor.read_slave_object(0, 1, 2, transport="http")
+
+
+def test_read_slave_object_rejects_unknown_transport():
+    from hdrive_eth.motor import HDriveETH
+
+    motor = HDriveETH("127.0.0.1", connect=False)
+
+    with pytest.raises(ValueError, match="transport"):
+        motor.read_slave_object(0, 1, 2, transport="serial")
+
+
 def test_build_can_conf_reset_command_wire_format():
-    """26 ``name="value"`` attrs so firmware ``getNumbers`` sees ``=`` pairs (RXConfigTicketCAN)."""
+    """26 ``name="value"`` attrs for ``RXConfigTicketCAN`` / ``parseTicketInt32s``."""
     import re
 
     from hdrive_eth.protocol import build_can_conf_command, build_can_conf_reset_command
