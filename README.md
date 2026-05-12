@@ -113,9 +113,27 @@ motor.stop()
 version = motor.read_object(index=3, subindex=0)
 print(f"Firmware version: {version}")
 
+# Read a CAN slave object over the same TCP command socket
+slave_voltage = motor.read_slave_object(slot=0, index=0, subindex=6)
+print(f"Slave voltage: {slave_voltage}")
+
+# Or use the HTTP slave-object gateway explicitly
+slave_voltage_http = motor.read_slave_object(
+    slot=0,
+    index=0,
+    subindex=6,
+    transport="http",
+    timeout=3.0,
+)
+print(f"Slave voltage (HTTP): {slave_voltage_http}")
+
 # Write a drive object (e.g. select BinaryTicket telemetry — m4s22 = 3)
 motor.write_object(index=4, subindex=22, value=3)
 ```
+
+For the existing HTTP slave-object gateway (`getData.cgi?slvobj=...`), use
+`HDriveETH.read_slvobj(...)` / `HDriveETH.write_slvobj(...)`. The unified instance
+API defaults to `transport="tcp"` and also accepts `transport="http"` for reads.
 
 ### Telemetry
 

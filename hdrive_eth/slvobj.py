@@ -5,6 +5,9 @@ Firmware completes ``getData.cgi?slvobj=…`` on the device; use
 :class:`hdrive_eth.HDriveETH.read_slvobj` / :meth:`hdrive_eth.HDriveETH.write_slvobj`,
 which build ``r_<slot>_<mainKey>_<subKey>`` and ``w_<slot>_<mainKey>_<subKey>_<value>`` on the wire.
 
+For unified instance reads, use :meth:`hdrive_eth.HDriveETH.read_slave_object`
+with ``transport="tcp"`` (default) or ``transport="http"``.
+
 ``slot`` is **0..7** (first slave = slot ``0``). ``main_key`` / ``sub_key`` are the slave
 node OD indices (``enMainKeys`` row + column).
 """

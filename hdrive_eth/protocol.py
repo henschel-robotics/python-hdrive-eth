@@ -10,6 +10,7 @@ Command format:
 
 from __future__ import annotations
 
+import re
 from typing import List, Optional, Sequence, Tuple
 
 
@@ -112,10 +113,46 @@ def build_disable_command() -> bytes:
     )
 
 
-# ``parseTicketInt32s`` (``ParseTicketInt32s.h``) walks the whole ticket and extracts *every*
-# decimal integer via ``strtol`` — **not** XML-aware. Names like ``n00`` / ``n01`` contain digits
-# before ``=``, so the firmware picks up spurious 0, 1, … and shifts ``numbers[]``, corrupting
-# slaves and ``specialCommand`` (slave error 40 / wrong modes). Use letters only — ``a``…``z``.
+def parse_ticket_int32s(text: str, max_count: int = 256) -> List[int]:
+    """Signed decimal ints in **attribute value** order — mirrors firmware ``parseTicketInt32s``.
+
+    Only runs after each ``=`` (optional whitespace, optional ``"``, then an integer). Digits in
+    attribute names (``d1``, ``s1s``, ``n00``, …) are not collected.
+    """
+    out: List[int] = []
+    i = 0
+    nmax = max(0, max_count)
+    while i < len(text) and len(out) < nmax:
+        if text[i] != "=":
+            i += 1
+            continue
+        i += 1
+        while i < len(text) and text[i].isspace():
+            i += 1
+        if i < len(text) and text[i] == '"':
+            i += 1
+        if i >= len(text):
+            break
+        c = text[i]
+        if c not in "-0123456789":
+            i += 1
+            continue
+        if c == "-" and (i + 1 >= len(text) or not text[i + 1].isdigit()):
+            i += 1
+            continue
+        m = re.match(r"-?\d+", text[i:])
+        if not m:
+            i += 1
+            continue
+        out.append(int(m.group(0), 10))
+        i += len(m.group(0))
+        if i < len(text) and text[i] == '"':
+            i += 1
+    return out
+
+
+# ``<canConf/>`` uses ``a``…``z`` for stable ordering and compact wire form (firmware
+# ``RXConfigTicketCAN``). Names with digits are safe on current firmware; letters stay the norm.
 _CANCONF_ATTR = "abcdefghijklmnopqrstuvwxyz"
 
 
@@ -123,9 +160,8 @@ def build_can_conf_command(values: Sequence[int]) -> bytes:
     """Build quoted ``<canConf …/>`` TCP bytes (firmware ``Communication/CommRX_Tickets/RXConfigTicketCAN.h``).
 
     The ticket hash matches the prefix ``"<canConf "``. ``interpretTicket`` uses
-    ``parseTicketInt32s``, which scans **left-to-right** and stores each digit run it sees
-    (see ``ParseTicketInt32s.h``). Attribute **names must not contain digits** — only ``a``…``z``
-    for the 26 values in order.
+    ``parseTicketInt32s`` (``ParseTicketInt32s.h``): signed decimals from each attribute **value**
+    in left-to-right order. Attribute names are conventionally ``a``…``z`` for the 26 values.
 
     - ``a`` ``demandedTorque`` (master, **mNm**) — ``numbers[0]``
     - ``b`` ``demandedMode`` (master; also copied to ``motorMode``) — ``numbers[1]``
@@ -148,9 +184,7 @@ def build_can_conf_reset_command() -> bytes:
     return build_can_conf_command([0] * 26)
 
 
-# Same ``parseTicketInt32s`` pitfall as :data:`_CANCONF_ATTR`: names like ``sl1`` / ``sl2`` contain
-# digits, so the firmware collects spurious ``1``, ``2``, … and shifts ``numbers[]`` — first slave
-# can stay at 0 while later slaves look correct. Use letters only for the nine position ints.
+# Master + eight slaves: single-letter names ``a``…``i`` (compact; digit names work on current fw).
 _CANPOS_ATTR = "abcdefghi"  # master tenths, then slaves 1–8 (tenths each)
 
 
@@ -166,7 +200,7 @@ def build_can_pos_command(master_deg: float, *slave_deg: float) -> bytes:
 
     Returns:
         ASCII bytes matching the firmware ``canPos`` ticket (quoted payload). Attribute names
-        are ``a``…``i`` (master + eight slaves) so ``parseTicketInt32s`` order matches values.
+        are ``a``…``i`` (master + eight slaves) in wire order.
     """
     m = int(round(master_deg * 10.0))
     s_vals = [int(round(d * 10.0)) for d in slave_deg]

@@ -16,6 +16,7 @@ Example::
 from __future__ import annotations
 
 import logging
+import re
 import socket
 import threading
 import time
@@ -516,25 +517,100 @@ class HDriveETH:
                 f"Failed to read m{index}s{subindex} after reconnect"
             )
 
-        import re
         logger.debug("objRead m%ds%d response: %s", index, subindex, resp)
+        return self._parse_read_response(resp, f"m{index}s{subindex}")
 
+    def read_slave_object(
+        self,
+        slot: int,
+        index: int,
+        subindex: int,
+        transport: str = "tcp",
+        timeout: float = 5.0,
+    ) -> int:
+        """Read a single CAN slave object using either TCP or HTTP.
+
+        ``transport="tcp"`` (default) uses the firmware ``<objReadCAN .../>`` ticket
+        on the existing command socket. ``transport="http"`` uses the existing
+        ``getData.cgi?slvobj=r_...`` gateway on the device webserver.
+
+        Args:
+            slot: CAN slave slot on the chain (``0`` is the first slave).
+            index: Slave object index.
+            subindex: Slave object sub-index.
+            transport: ``"tcp"`` (default) or ``"http"``.
+            timeout: Network timeout in seconds (HTTP only; ignored for TCP).
+
+        Returns:
+            The integer value of the slave object.
+
+        Raises:
+            CommandError: If the request fails or the drive returns an error.
+        """
+        transport_key = transport.strip().lower()
+        if transport_key == "http":
+            body = self.read_slvobj(self.ip, slot, index, subindex, timeout)
+            logger.debug(
+                "slvobj HTTP read sl%dm%ds%d response: %s", slot, index, subindex, body
+            )
+            return self._parse_http_slave_read_response(
+                body, f"sl{slot}m{index}s{subindex}"
+            )
+        if transport_key != "tcp":
+            raise ValueError(
+                f"Unsupported slave read transport {transport!r}; expected 'tcp' or 'http'"
+            )
+
+        for attempt in range(2):
+            resp = self._try_read_slave_object(slot, index, subindex)
+            if resp is not None:
+                break
+            logger.debug(
+                "Reconnecting TCP for objReadCAN sl%dm%ds%d (attempt %d) ...",
+                slot,
+                index,
+                subindex,
+                attempt + 2,
+            )
+            self._reconnect_tcp()
+        else:
+            raise CommandError(
+                f"Failed to read sl{slot}m{index}s{subindex} after reconnect"
+            )
+
+        logger.debug(
+            "objReadCAN sl%dm%ds%d response: %s", slot, index, subindex, resp
+        )
+        return self._parse_read_response(resp, f"sl{slot}m{index}s{subindex}")
+
+    @staticmethod
+    def _parse_read_response(resp: str, target: str) -> int:
         if "error=" in resp:
-            raise CommandError(f"Drive returned error for m{index}s{subindex}: {resp}")
+            raise CommandError(f"Drive returned error for {target}: {resp}")
 
-        # New format: <r a="4" b="22" v="3" />
         value_match = re.search(r'v="(-?\d+)"', resp)
         if value_match:
             return int(value_match.group(1))
 
+        raise CommandError(f"Failed to parse read response for {target}: {resp}")
+
+    @staticmethod
+    def _parse_http_slave_read_response(body: str, target: str) -> int:
+        text = body.strip()
+        if not text:
+            raise CommandError(f"Empty slave read response for {target}")
+        if text.upper().startswith("ERR"):
+            raise CommandError(f"Drive returned error for {target}: {text}")
+        ok_match = re.fullmatch(r"(?:OK\s+)?(-?\d+)", text, flags=re.IGNORECASE)
+        if ok_match:
+            return int(ok_match.group(1))
         raise CommandError(
-            f"Failed to parse read response for m{index}s{subindex}: {resp}"
+            f"Failed to parse HTTP slave read response for {target}: {body}"
         )
 
     def _try_read_object(self, index: int, subindex: int) -> Optional[str]:
         """Send an objRead request and return the response, or None if the
         connection was closed."""
-        import re
         xml = f'<objRead a="{index}" b="{subindex}" />'
         with self._lock:
             sock = self._socket
@@ -563,6 +639,56 @@ class HDriveETH:
                         return match.group(0)
             except OSError as exc:
                 logger.debug("objRead m%ds%d: OSError %s", index, subindex, exc)
+                return None
+            finally:
+                sock.settimeout(prev_timeout)
+
+    def _try_read_slave_object(
+        self, slot: int, index: int, subindex: int
+    ) -> Optional[str]:
+        """Send an ``objReadCAN`` request and return the response, or ``None`` if
+        the connection was closed."""
+        xml = f'<objReadCAN sl="{slot}" m="{index}" s="{subindex}" />'
+        with self._lock:
+            sock = self._socket
+            prev_timeout = sock.gettimeout()
+            try:
+                sock.settimeout(5.0)
+                sock.sendall(xml.encode("ascii"))
+
+                buf = ""
+                while True:
+                    try:
+                        chunk = sock.recv(4096)
+                    except socket.timeout:
+                        logger.debug(
+                            "objReadCAN sl%dm%ds%d: recv timed out",
+                            slot,
+                            index,
+                            subindex,
+                        )
+                        return None
+                    if not chunk:
+                        logger.debug(
+                            "objReadCAN sl%dm%ds%d: connection closed by drive",
+                            slot,
+                            index,
+                            subindex,
+                        )
+                        return None
+                    buf += chunk.decode("ascii", errors="replace")
+
+                    match = re.search(r'<r\s[^>]*/>', buf)
+                    if match:
+                        return match.group(0)
+            except OSError as exc:
+                logger.debug(
+                    "objReadCAN sl%dm%ds%d: OSError %s",
+                    slot,
+                    index,
+                    subindex,
+                    exc,
+                )
                 return None
             finally:
                 sock.settimeout(prev_timeout)
